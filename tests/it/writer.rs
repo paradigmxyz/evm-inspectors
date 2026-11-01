@@ -402,3 +402,40 @@ fn test_fallback_short_calldata() {
         "Short calldata call should NOT show 'receive' in trace, got:\n{trace_output}"
     );
 }
+
+/// Creations that send value show it, as calls do.
+#[test]
+fn test_create_with_value() {
+    // Returns empty runtime code.
+    let initcode = bytes!("60006000f3");
+
+    let caller = address!("0x0000000000000000000000000000000000000001");
+    let mut db = CacheDB::new(EmptyDB::default());
+    db.insert_account_info(
+        caller,
+        revm::state::AccountInfo { balance: U256::from(1_000_000), ..Default::default() },
+    );
+
+    let mut evm = Context::mainnet()
+        .with_db(db)
+        .build_mainnet_with_inspector(TracingInspector::new(TracingInspectorConfig::all()));
+
+    let result = evm
+        .inspect_tx_commit(
+            TxEnv::builder()
+                .caller(caller)
+                .data(initcode)
+                .value(U256::from(42))
+                .kind(TransactTo::Create)
+                .gas_priority_fee(None)
+                .build_fill(),
+        )
+        .unwrap();
+    assert!(result.is_success(), "creation with value should succeed");
+
+    let trace_output = write_traces(evm.inspector());
+    assert!(
+        trace_output.contains("@0x522B3294E6d06aA25Ad0f1B8891242E335D3B459{value: 42}"),
+        "creation with value should show it in the trace, got:\n{trace_output}"
+    );
+}
