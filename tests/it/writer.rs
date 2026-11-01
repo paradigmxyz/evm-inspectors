@@ -115,6 +115,32 @@ fn deploy_fail() {
     assert_traces(base_path, Some("decoded"), None, evm.inspector());
 }
 
+#[test]
+fn deploy_constructor_args() {
+    let base_path = &Path::new(OUT_DIR).join("deploy_constructor_args");
+
+    let mut evm = Context::mainnet()
+        .with_db(CacheDB::new(EmptyDB::default()))
+        .build_mainnet_with_inspector(TracingInspector::new(TracingInspectorConfig::all()));
+
+    // Returns empty code; the trailing word stands in for an ABI-encoded constructor argument.
+    inspect_deploy_contract(
+        &mut evm,
+        bytes!("60006000f3000000000000000000000000000000000000000000000000000000000000002a"),
+        Address::default(),
+        SpecId::LONDON,
+    );
+
+    let node = &mut evm.inspector().traces_mut().nodes_mut()[0];
+    node.trace.decoded().label = Some("Counter".to_string());
+    node.trace.decoded().call_data = Some(DecodedCallData {
+        signature: "constructor(uint256,address)".to_string(),
+        args: vec!["42".to_string(), "0x000000000000000000000000000000000000bEEF".to_string()],
+    });
+
+    assert_traces(base_path, Some("decoded"), None, evm.inspector());
+}
+
 // (name, address)
 const LABELS: &[(&str, Address)] =
     &[("Counter", address!("Bd770416a3345F91E4B34576cb804a576fa48EB1"))];
