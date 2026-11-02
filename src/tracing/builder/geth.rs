@@ -1,6 +1,6 @@
 //! Geth trace builder
 use crate::tracing::{
-    types::{CallKind, CallTraceNode, CallTraceStepStackItem},
+    types::{CallKind, CallTraceNode, CallTraceStepStackItem, TraceMemberOrder},
     utils::load_account_code,
 };
 use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, format, vec, vec::Vec};
@@ -33,6 +33,17 @@ struct PendingCallFrame<T> {
     /// the frame itself contains logs.
     logs_visible: bool,
     frame: T,
+}
+
+/// The fields of an [`Erc7562Frame`] collected from the frame's opcodes.
+#[derive(Default)]
+struct Erc7562OpcodeData {
+    accessed_slots: AccessedSlots,
+    used_opcodes: HashMap<u8, u64>,
+    contract_size: HashMap<Address, ContractSize>,
+    ext_code_access_info: Vec<String>,
+    keccak: Vec<Bytes>,
+    out_of_gas: bool,
 }
 
 /// A type for creating geth style traces
@@ -494,123 +505,149 @@ impl<'a> GethTraceBuilder<'a> {
             Some(root)
         };
 
-        let mut frames: Vec<PendingCallFrame<Erc7562Frame>> = Vec::with_capacity(self.nodes.len());
-
-        for (idx, node) in self.nodes.iter().enumerate() {
-            let trace = &node.trace;
-
-            let mut accessed_slots = AccessedSlots::default();
-            let mut used_opcodes = HashMap::default();
-            let mut contract_size = HashMap::default();
-            let mut ext_code_access_info = Vec::new();
-            let mut keccak = Vec::new();
-            let mut out_of_gas = false;
-
-            for step in &trace.steps {
-                let op = step.op.get();
-
-                // Ignored opcodes are only left out of `usedOpcodes`
-                if !ignored_opcodes[op as usize] {
-                    *used_opcodes.entry(op).or_insert(0) += 1;
+        // The opcode-derived fields of each frame. Steps are visited in execution order across
+        // frames, like geth's `OnOpcode` hook, because some rules depend on the previous opcode.
+        let mut opcode_data: Vec<Erc7562OpcodeData> =
+            self.nodes.iter().map(|_| Erc7562OpcodeData::default()).collect();
+        // The previous opcode, geth's `lastOpWithStack`
+        let mut last_op: Option<u8> = None;
+        // (node index, next index into the node's `ordering`)
+        let mut walk = vec![(0usize, 0usize)];
+        while let Some((idx, pos)) = walk.pop() {
+            let node = &self.nodes[idx];
+            let Some(item) = node.ordering.get(pos) else { continue };
+            walk.push((idx, pos + 1));
+            let step = match *item {
+                TraceMemberOrder::Step(step_idx) => &node.trace.steps[step_idx],
+                TraceMemberOrder::Call(child_idx) => {
+                    walk.push((node.children[child_idx], 0));
+                    continue;
                 }
+                TraceMemberOrder::Log(_) => continue,
+            };
+            let Erc7562OpcodeData {
+                accessed_slots,
+                used_opcodes,
+                contract_size,
+                ext_code_access_info,
+                keccak,
+                out_of_gas,
+            } = &mut opcode_data[idx];
+            let op = step.op.get();
 
-                // Accessed storage slots
-                match op {
-                    opcode::SLOAD => {
-                        if let Some(stack) = &step.stack {
-                            if let Some(slot) = stack.get(stack.len().saturating_sub(1)) {
-                                let slot: B256 = (*slot).into();
-                                let already_read = accessed_slots.reads.contains_key(&slot);
-                                let already_written = accessed_slots.writes.contains_key(&slot);
-                                if !already_read && !already_written {
-                                    if let Some(change) = &step.storage_change {
-                                        let value: B256 = change.value.into();
-                                        accessed_slots.reads.entry(slot).or_default().push(value);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    opcode::SSTORE => {
-                        if let Some(stack) = &step.stack {
-                            if let Some(slot) = stack.get(stack.len().saturating_sub(1)) {
-                                let slot: B256 = (*slot).into();
-                                *accessed_slots.writes.entry(slot).or_insert(0) += 1;
-                            }
-                        }
-                    }
-                    opcode::TLOAD => {
-                        if let Some(stack) = &step.stack {
-                            if let Some(slot) = stack.get(stack.len().saturating_sub(1)) {
-                                let slot: B256 = (*slot).into();
-                                *accessed_slots.transient_reads.entry(slot).or_insert(0) += 1;
-                            }
-                        }
-                    }
-                    opcode::TSTORE => {
-                        if let Some(stack) = &step.stack {
-                            if let Some(slot) = stack.get(stack.len().saturating_sub(1)) {
-                                let slot: B256 = (*slot).into();
-                                *accessed_slots.transient_writes.entry(slot).or_insert(0) += 1;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+            if matches!(op, opcode::RETURN | opcode::REVERT) {
+                last_op = None;
+            }
 
-                if let Some(status) = &step.status {
-                    if *status == revm::interpreter::InstructionResult::OutOfGas {
-                        out_of_gas = true;
-                    }
-                }
+            // [OP-012] GAS is only reported if the next opcode is not a call
+            if last_op == Some(opcode::GAS) && !is_erc7562_call(op) {
+                *used_opcodes.entry(opcode::GAS).or_insert(0) += 1;
+            }
 
-                if matches!(op, opcode::EXTCODESIZE | opcode::EXTCODECOPY | opcode::EXTCODEHASH) {
+            // Ignored opcodes are only left out of `usedOpcodes`
+            if op != opcode::GAS && !ignored_opcodes[op as usize] {
+                *used_opcodes.entry(op).or_insert(0) += 1;
+            }
+
+            // Accessed storage slots
+            match op {
+                opcode::SLOAD => {
                     if let Some(stack) = &step.stack {
-                        if let Some(item) = stack.get(stack.len().saturating_sub(1)) {
-                            let address = Address::from_word((*item).into());
-                            ext_code_access_info.push(format!("{address:?}"));
-                            if let Entry::Vacant(e) = contract_size.entry(address) {
-                                if let Ok(Some(account)) = db.basic_ref(address) {
-                                    if account.code_hash != KECCAK_EMPTY {
-                                        if let Ok(bytecode) = db.code_by_hash_ref(account.code_hash)
-                                        {
-                                            e.insert(ContractSize {
-                                                contract_size: bytecode.original_bytes().len()
-                                                    as u64,
-                                                opcode: op,
-                                            });
-                                        }
-                                    }
+                        if let Some(slot) = stack.get(stack.len().saturating_sub(1)) {
+                            let slot: B256 = (*slot).into();
+                            let already_read = accessed_slots.reads.contains_key(&slot);
+                            let already_written = accessed_slots.writes.contains_key(&slot);
+                            if !already_read && !already_written {
+                                if let Some(change) = &step.storage_change {
+                                    let value: B256 = change.value.into();
+                                    accessed_slots.reads.entry(slot).or_default().push(value);
                                 }
                             }
                         }
                     }
                 }
+                opcode::SSTORE => {
+                    if let Some(stack) = &step.stack {
+                        if let Some(slot) = stack.get(stack.len().saturating_sub(1)) {
+                            let slot: B256 = (*slot).into();
+                            *accessed_slots.writes.entry(slot).or_insert(0) += 1;
+                        }
+                    }
+                }
+                opcode::TLOAD => {
+                    if let Some(stack) = &step.stack {
+                        if let Some(slot) = stack.get(stack.len().saturating_sub(1)) {
+                            let slot: B256 = (*slot).into();
+                            *accessed_slots.transient_reads.entry(slot).or_insert(0) += 1;
+                        }
+                    }
+                }
+                opcode::TSTORE => {
+                    if let Some(stack) = &step.stack {
+                        if let Some(slot) = stack.get(stack.len().saturating_sub(1)) {
+                            let slot: B256 = (*slot).into();
+                            *accessed_slots.transient_writes.entry(slot).or_insert(0) += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
 
-                // KECCAK preimages from returndata
-                if op == opcode::KECCAK256 && !out_of_gas {
-                    if let (Some(stack), Some(memory)) = (&step.stack, &step.memory) {
-                        if stack.len() >= 2 {
-                            let offset = stack[stack.len() - 1];
-                            let len = stack[stack.len() - 2];
-                            if let (Ok(offset), Ok(len)) =
-                                (usize::try_from(offset), usize::try_from(len))
-                            {
-                                let mut data = vec![0; len];
-                                if offset < memory.0.len() {
-                                    let end = (offset + len).min(memory.0.len());
-                                    let copy_len = end - offset;
-                                    data[..copy_len].copy_from_slice(&memory.0[offset..end]);
+            if let Some(status) = &step.status {
+                if *status == revm::interpreter::InstructionResult::OutOfGas {
+                    *out_of_gas = true;
+                }
+            }
+
+            if matches!(op, opcode::EXTCODESIZE | opcode::EXTCODECOPY | opcode::EXTCODEHASH) {
+                if let Some(stack) = &step.stack {
+                    if let Some(item) = stack.get(stack.len().saturating_sub(1)) {
+                        let address = Address::from_word((*item).into());
+                        ext_code_access_info.push(format!("{address:?}"));
+                        if let Entry::Vacant(e) = contract_size.entry(address) {
+                            if let Ok(Some(account)) = db.basic_ref(address) {
+                                if account.code_hash != KECCAK_EMPTY {
+                                    if let Ok(bytecode) = db.code_by_hash_ref(account.code_hash) {
+                                        e.insert(ContractSize {
+                                            contract_size: bytecode.original_bytes().len() as u64,
+                                            opcode: op,
+                                        });
+                                    }
                                 }
-                                keccak.push(Bytes::from(data));
                             }
                         }
                     }
                 }
             }
 
+            // KECCAK preimages from returndata
+            if op == opcode::KECCAK256 && !*out_of_gas {
+                if let (Some(stack), Some(memory)) = (&step.stack, &step.memory) {
+                    if stack.len() >= 2 {
+                        let offset = stack[stack.len() - 1];
+                        let len = stack[stack.len() - 2];
+                        if let (Ok(offset), Ok(len)) =
+                            (usize::try_from(offset), usize::try_from(len))
+                        {
+                            let mut data = vec![0; len];
+                            if offset < memory.0.len() {
+                                let end = (offset + len).min(memory.0.len());
+                                let copy_len = end - offset;
+                                data[..copy_len].copy_from_slice(&memory.0[offset..end]);
+                            }
+                            keccak.push(Bytes::from(data));
+                        }
+                    }
+                }
+            }
+
+            last_op = Some(op);
+        }
+
+        let mut frames: Vec<PendingCallFrame<Erc7562Frame>> = Vec::with_capacity(self.nodes.len());
+        for ((idx, node), data) in self.nodes.iter().enumerate().zip(opcode_data) {
             let include_logs = include_logs
-                && !trace.is_error()
+                && !node.trace.is_error()
                 && node.parent.is_none_or(|parent| frames[parent].logs_visible);
             let call_frame = if idx == 0 {
                 top_call.take().unwrap()
@@ -634,12 +671,12 @@ impl<'a> GethTraceBuilder<'a> {
                     revert_reason: call_frame.revert_reason,
                     logs: call_frame.logs,
                     value: call_frame.value,
-                    accessed_slots,
-                    ext_code_access_info,
-                    used_opcodes,
-                    contract_size,
-                    out_of_gas,
-                    keccak,
+                    accessed_slots: data.accessed_slots,
+                    ext_code_access_info: data.ext_code_access_info,
+                    used_opcodes: data.used_opcodes,
+                    contract_size: data.contract_size,
+                    out_of_gas: data.out_of_gas,
+                    keccak: data.keccak,
                     calls: vec![],
                 },
             });
@@ -709,6 +746,11 @@ fn erc7562_ignored_opcodes(configured: &[u8]) -> [bool; 256] {
         }
     }
     ignored
+}
+
+/// Returns true for the opcodes geth's ERC-7562 tracer treats as calls (`isCall`).
+const fn is_erc7562_call(op: u8) -> bool {
+    matches!(op, opcode::CALL | opcode::CALLCODE | opcode::DELEGATECALL | opcode::STATICCALL)
 }
 
 fn account_was_empty(account: &AccountInfo) -> bool {

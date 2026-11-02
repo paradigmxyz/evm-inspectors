@@ -318,6 +318,8 @@ fn test_geth_erc7562_tracer() {
 
 const ERC7562_ROOT: Address = address!("1000000000000000000000000000000000000001");
 const ERC7562_CHILD: Address = address!("1000000000000000000000000000000000000003");
+const ERC7562_NO_CODE: Address = address!("000000000000000000000000000000000000dead");
+const ERC7562_NO_CODE_2: Address = address!("000000000000000000000000000000000000beef");
 
 /// Calls [`ERC7562_ROOT`] running `code`, with `child_code` deployed at [`ERC7562_CHILD`].
 fn trace_erc7562(config: Erc7562Config, code: &[u8], child_code: &[u8]) -> Erc7562Frame {
@@ -358,6 +360,16 @@ fn trace_erc7562(config: Erc7562Config, code: &[u8], child_code: &[u8]) -> Erc75
     }
 }
 
+/// `PUSH1 0 (x5) PUSH20 <to> GAS CALL POP`, or `PUSH1 0 (x4) PUSH20 <to> GAS STATICCALL POP`
+fn erc7562_call(op: u8, to: Address) -> Vec<u8> {
+    let args = if op == opcode::STATICCALL { 4 } else { 5 };
+    let mut code = [opcode::PUSH1, 0].repeat(args);
+    code.push(opcode::PUSH20);
+    code.extend_from_slice(to.as_slice());
+    code.extend_from_slice(&[opcode::GAS, op, opcode::POP]);
+    code
+}
+
 fn erc7562_used(ops: &[(u8, u64)]) -> HashMap<u8, u64> {
     ops.iter().copied().collect()
 }
@@ -386,6 +398,25 @@ fn test_geth_erc7562_custom_ignored_opcodes() {
         erc7562_used(&[(opcode::PUSH1, 1), (opcode::POP, 1), (opcode::STOP, 1)])
     );
     assert_eq!(frame.accessed_slots.reads, HashMap::from_iter([(B256::ZERO, vec![B256::ZERO])]));
+}
+
+// OP-012: GAS is allowed right before a CALL-type opcode and is not reported then.
+#[test]
+fn test_geth_erc7562_gas_before_call() {
+    let mut code = vec![opcode::GAS, opcode::POP];
+    code.extend(erc7562_call(opcode::CALL, ERC7562_NO_CODE));
+    code.extend(erc7562_call(opcode::STATICCALL, ERC7562_NO_CODE_2));
+    code.push(opcode::STOP);
+    let frame = trace_erc7562(Erc7562Config::default(), &code, &[]);
+    assert_eq!(
+        frame.used_opcodes,
+        erc7562_used(&[
+            (opcode::GAS, 1),
+            (opcode::CALL, 1),
+            (opcode::STATICCALL, 1),
+            (opcode::STOP, 1)
+        ])
+    );
 }
 
 fn trace_contract(
