@@ -332,7 +332,7 @@ impl TracingInspector {
     /// This will be the last call trace pushed to the stack: the call we entered most recently.
     #[track_caller]
     #[inline]
-    fn active_trace(&self) -> Option<&CallTraceNode> {
+    pub fn active_trace(&self) -> Option<&CallTraceNode> {
         self.trace_stack.last().map(|idx| &self.traces.arena[*idx])
     }
 
