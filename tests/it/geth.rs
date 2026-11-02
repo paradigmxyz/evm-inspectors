@@ -7,9 +7,11 @@ use crate::utils::deploy_contract;
 use alloy_primitives::{address, hex, map::HashMap, Address, Bytes, TxKind, B256, U256};
 use alloy_rpc_types_eth::TransactionInfo;
 use alloy_rpc_types_trace::geth::{
-    erc7562::Erc7562Config, mux::MuxConfig, CallConfig, FlatCallConfig, GethDebugBuiltInTracerType,
-    GethDebugTracerConfig, GethDebugTracerType, GethDebugTracingOptions, GethDefaultTracingOptions,
-    GethTrace, PreStateConfig, PreStateFrame,
+    erc7562::{Erc7562Config, Erc7562Frame},
+    mux::MuxConfig,
+    CallConfig, FlatCallConfig, GethDebugBuiltInTracerType, GethDebugTracerConfig,
+    GethDebugTracerType, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace,
+    PreStateConfig, PreStateFrame,
 };
 use revm::{
     bytecode::{opcode, Bytecode},
@@ -312,6 +314,78 @@ fn test_geth_erc7562_tracer() {
         }
         _ => panic!("Expected Erc7562Tracer"),
     }
+}
+
+const ERC7562_ROOT: Address = address!("1000000000000000000000000000000000000001");
+const ERC7562_CHILD: Address = address!("1000000000000000000000000000000000000003");
+
+/// Calls [`ERC7562_ROOT`] running `code`, with `child_code` deployed at [`ERC7562_CHILD`].
+fn trace_erc7562(config: Erc7562Config, code: &[u8], child_code: &[u8]) -> Erc7562Frame {
+    let caller = address!("1000000000000000000000000000000000000002");
+    let context =
+        Context::mainnet().with_db(CacheDB::<EmptyDB>::default()).modify_db_chained(|db| {
+            for (address, code) in [(ERC7562_ROOT, code), (ERC7562_CHILD, child_code)] {
+                let code = Bytecode::new_raw(Bytes::copy_from_slice(code));
+                db.insert_account_info(
+                    address,
+                    AccountInfo {
+                        code_hash: code.hash_slow(),
+                        code: Some(code),
+                        ..Default::default()
+                    },
+                );
+            }
+        });
+    let opts = GethDebugTracingOptions::erc7562_tracer(config);
+    let mut inspector = DebugInspector::new(opts).unwrap();
+    let mut evm = context.build_mainnet().with_inspector(&mut inspector);
+    let res = evm
+        .inspect_tx(TxEnv {
+            caller,
+            gas_limit: 1_000_000,
+            gas_price: 0,
+            kind: TransactTo::Call(ERC7562_ROOT),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(res.result.is_success(), "{res:#?}");
+    let (ctx, inspector) = evm.ctx_inspector();
+    let tx_env = ctx.tx().clone();
+    let block_env = ctx.block().clone();
+    match inspector.get_result(None, &tx_env, &block_env, &res, ctx.db_mut()).unwrap() {
+        GethTrace::Erc7562Tracer(frame) => frame,
+        trace => panic!("expected an erc7562 trace, got {trace:?}"),
+    }
+}
+
+fn erc7562_used(ops: &[(u8, u64)]) -> HashMap<u8, u64> {
+    ops.iter().copied().collect()
+}
+
+// geth only counts opcodes outside its default ignore list (PUSH*, DUP*, SWAP*, POP and simple
+// arithmetic):
+// <https://github.com/ethereum/go-ethereum/blob/00821e33e43686a30c4ddcb49991307dc5a4db0e/eth/tracers/native/erc7562.go#L519-L537>
+#[test]
+fn test_geth_erc7562_default_ignored_opcodes() {
+    // PUSH1 1 PUSH1 2 ADD DUP1 SWAP1 POP POP STOP
+    let code = hex!("60016002018090505000");
+    let frame = trace_erc7562(Erc7562Config::default(), &code, &[]);
+    assert_eq!(frame.used_opcodes, erc7562_used(&[(opcode::STOP, 1)]));
+}
+
+// A configured ignore list replaces the default one and only affects `usedOpcodes`; geth still
+// records storage access for ignored opcodes.
+#[test]
+fn test_geth_erc7562_custom_ignored_opcodes() {
+    // PUSH1 0 SLOAD POP STOP
+    let code = hex!("6000545000");
+    let config = Erc7562Config { ignored_opcodes: vec![opcode::SLOAD], ..Default::default() };
+    let frame = trace_erc7562(config, &code, &[]);
+    assert_eq!(
+        frame.used_opcodes,
+        erc7562_used(&[(opcode::PUSH1, 1), (opcode::POP, 1), (opcode::STOP, 1)])
+    );
+    assert_eq!(frame.accessed_slots.reads, HashMap::from_iter([(B256::ZERO, vec![B256::ZERO])]));
 }
 
 fn trace_contract(

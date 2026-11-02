@@ -484,6 +484,7 @@ impl<'a> GethTraceBuilder<'a> {
         }
 
         let include_logs = opts.with_log.unwrap_or_default();
+        let ignored_opcodes = erc7562_ignored_opcodes(&opts.ignored_opcodes);
 
         // only the root frame's own fields are needed, its children are assembled below
         let mut top_call = {
@@ -508,13 +509,10 @@ impl<'a> GethTraceBuilder<'a> {
             for step in &trace.steps {
                 let op = step.op.get();
 
-                // Skip if opcode is ignored
-                if opts.ignored_opcodes.contains(&op) {
-                    continue;
+                // Ignored opcodes are only left out of `usedOpcodes`
+                if !ignored_opcodes[op as usize] {
+                    *used_opcodes.entry(op).or_insert(0) += 1;
                 }
-
-                // Count used opcodes
-                *used_opcodes.entry(op).or_insert(0) += 1;
 
                 // Accessed storage slots
                 match op {
@@ -674,6 +672,43 @@ impl<'a> GethTraceBuilder<'a> {
             CallKind::AuthCall => CallFrameType::Call,
         }
     }
+}
+
+/// Returns a lookup table of the opcodes left out of the ERC-7562 `usedOpcodes`.
+///
+/// Like geth, an unset (here: empty) list means the default list: `PUSH0` to `SWAP16`, `POP` and
+/// simple arithmetic and comparison opcodes.
+/// <https://github.com/ethereum/go-ethereum/blob/00821e33e43686a30c4ddcb49991307dc5a4db0e/eth/tracers/native/erc7562.go#L175-L186>
+/// <https://github.com/ethereum/go-ethereum/blob/00821e33e43686a30c4ddcb49991307dc5a4db0e/eth/tracers/native/erc7562.go#L519-L537>
+fn erc7562_ignored_opcodes(configured: &[u8]) -> [bool; 256] {
+    let mut ignored = [false; 256];
+    if configured.is_empty() {
+        for op in (opcode::PUSH0..=opcode::SWAP16).chain([
+            opcode::POP,
+            opcode::ADD,
+            opcode::SUB,
+            opcode::MUL,
+            opcode::DIV,
+            opcode::EQ,
+            opcode::LT,
+            opcode::GT,
+            opcode::SLT,
+            opcode::SGT,
+            opcode::SHL,
+            opcode::SHR,
+            opcode::AND,
+            opcode::OR,
+            opcode::NOT,
+            opcode::ISZERO,
+        ]) {
+            ignored[op as usize] = true;
+        }
+    } else {
+        for &op in configured {
+            ignored[op as usize] = true;
+        }
+    }
+    ignored
 }
 
 fn account_was_empty(account: &AccountInfo) -> bool {
