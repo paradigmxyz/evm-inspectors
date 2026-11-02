@@ -478,6 +478,29 @@ fn test_geth_erc7562_keccak_preimages() {
     assert!(frame.calls[0].keccak.is_empty());
 }
 
+// Compares with the output of geth's erc7562Tracer
+// (go-ethereum 00821e33e43686a30c4ddcb49991307dc5a4db0e) for the same transaction:
+// `testdata/erc7562/geth_parity.json`.
+#[test]
+fn test_geth_erc7562_parity() {
+    let mut code = vec![opcode::GAS, opcode::POP];
+    code.extend(erc7562_ext(opcode::EXTCODESIZE, ERC7562_NO_CODE));
+    code.extend_from_slice(&[opcode::ISZERO, opcode::POP]);
+    code.extend(erc7562_ext(opcode::EXTCODEHASH, ERC7562_CHILD));
+    code.push(opcode::POP);
+    code.extend(hex!("602060002050602060002050"));
+    code.extend(erc7562_call(opcode::CALL, ERC7562_CHILD));
+    code.extend(erc7562_call(opcode::STATICCALL, ERC7562_NO_CODE_2));
+    code.extend(hex!("6000545000"));
+    let child = hex!("6020600020506000600020505a5000");
+
+    let frame = trace_erc7562(Erc7562Config::default(), &code, &child);
+    let actual = serde_json::to_value(&frame).unwrap();
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("../../testdata/erc7562/geth_parity.json")).unwrap();
+    assert_eq!(actual, expected);
+}
+
 fn trace_contract(
     spec: SpecId,
     opts: GethDebugTracingOptions,
