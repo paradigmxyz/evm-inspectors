@@ -873,6 +873,18 @@ where
             maybe_precompile,
         );
 
+        // `to` is the account whose code runs. revm loads it, and its delegate if it has one,
+        // before this hook, so reading the journal state here does not load or warm an account.
+        let delegated_to = context
+            .journal_ref()
+            .evm_state()
+            .get(&to)
+            .and_then(|account| account.info.code.as_ref())
+            .and_then(|code| code.eip7702_address());
+        if delegated_to.is_some() {
+            self.last_trace().trace.delegated_to = delegated_to;
+        }
+
         None
     }
 

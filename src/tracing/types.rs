@@ -69,6 +69,13 @@ pub struct CallTrace {
     ///
     /// Note: This is optional because not all tracers make use of this.
     pub maybe_precompile: Option<bool>,
+    /// The address whose code this call ran because [`address`](Self::address) holds an EIP-7702
+    /// delegation designator.
+    ///
+    /// `None` for accounts without a delegation, for contract creations, and for traces recorded
+    /// before this field existed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub delegated_to: Option<Address>,
     /// The address of the selfdestructed contract.
     pub selfdestruct_address: Option<Address>,
     /// Holds the target for the selfdestruct refund target.

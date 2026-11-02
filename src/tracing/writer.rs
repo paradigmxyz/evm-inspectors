@@ -313,6 +313,13 @@ impl<W: Write> TraceWriter<W> {
             if let Some(action) = action {
                 write!(self.writer, "{trace_kind_style}{action}{trace_kind_style:#}")?;
             }
+
+            if let Some(delegate) = trace.delegated_to {
+                write!(
+                    self.writer,
+                    "{trace_kind_style} [delegated to {delegate}]{trace_kind_style:#}"
+                )?;
+            }
         }
 
         Ok(())
