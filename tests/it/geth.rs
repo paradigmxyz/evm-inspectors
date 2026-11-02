@@ -463,6 +463,21 @@ fn test_geth_erc7562_contract_size() {
     );
 }
 
+// Keccak preimages of the whole transaction are deduplicated, sorted and stored on the root frame.
+#[test]
+fn test_geth_erc7562_keccak_preimages() {
+    // KECCAK256(0, 32) POP, twice
+    let mut code = hex!("602060002050602060002050").to_vec();
+    code.extend(erc7562_call(opcode::CALL, ERC7562_CHILD));
+    code.push(opcode::STOP);
+    // KECCAK256(0, 32) POP KECCAK256(0, 0) POP STOP
+    let child = hex!("60206000205060006000205000");
+    let frame = trace_erc7562(Erc7562Config::default(), &code, &child);
+    assert_eq!(frame.keccak, vec![Bytes::new(), Bytes::from(vec![0; 32])]);
+    assert_eq!(frame.calls.len(), 1);
+    assert!(frame.calls[0].keccak.is_empty());
+}
+
 fn trace_contract(
     spec: SpecId,
     opts: GethDebugTracingOptions,

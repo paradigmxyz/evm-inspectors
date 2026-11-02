@@ -3,7 +3,13 @@ use crate::tracing::{
     types::{CallKind, CallTraceNode, CallTraceStep, CallTraceStepStackItem, TraceMemberOrder},
     utils::load_account_code,
 };
-use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, format, vec, vec::Vec};
+use alloc::{
+    borrow::Cow,
+    boxed::Box,
+    collections::{BTreeMap, BTreeSet},
+    format, vec,
+    vec::Vec,
+};
 use alloy_primitives::{
     map::{Entry, HashMap},
     Address, Bytes, B256, U256,
@@ -42,7 +48,6 @@ struct Erc7562OpcodeData {
     used_opcodes: HashMap<u8, u64>,
     contract_size: HashMap<Address, ContractSize>,
     ext_code_access_info: Vec<String>,
-    keccak: Vec<Bytes>,
     out_of_gas: bool,
 }
 
@@ -509,6 +514,8 @@ impl<'a> GethTraceBuilder<'a> {
         // frames, like geth's `OnOpcode` hook, because some rules depend on the previous opcode.
         let mut opcode_data: Vec<Erc7562OpcodeData> =
             self.nodes.iter().map(|_| Erc7562OpcodeData::default()).collect();
+        // Keccak preimages of the whole transaction, reported sorted on the root frame
+        let mut keccak = BTreeSet::new();
         // The previous step, geth's `lastOpWithStack`
         let mut last_step: Option<&CallTraceStep> = None;
         // (node index, next index into the node's `ordering`)
@@ -530,7 +537,6 @@ impl<'a> GethTraceBuilder<'a> {
                 used_opcodes,
                 contract_size,
                 ext_code_access_info,
-                keccak,
                 out_of_gas,
             } = &mut opcode_data[idx];
             let op = step.op.get();
@@ -628,24 +634,9 @@ impl<'a> GethTraceBuilder<'a> {
                 }
             }
 
-            // KECCAK preimages from returndata
-            if op == opcode::KECCAK256 && !*out_of_gas {
-                if let (Some(stack), Some(memory)) = (&step.stack, &step.memory) {
-                    if stack.len() >= 2 {
-                        let offset = stack[stack.len() - 1];
-                        let len = stack[stack.len() - 2];
-                        if let (Ok(offset), Ok(len)) =
-                            (usize::try_from(offset), usize::try_from(len))
-                        {
-                            let mut data = vec![0; len];
-                            if offset < memory.0.len() {
-                                let end = (offset + len).min(memory.0.len());
-                                let copy_len = end - offset;
-                                data[..copy_len].copy_from_slice(&memory.0[offset..end]);
-                            }
-                            keccak.push(Bytes::from(data));
-                        }
-                    }
+            if op == opcode::KECCAK256 {
+                if let Some(preimage) = erc7562_keccak_preimage(step) {
+                    keccak.insert(preimage);
                 }
             }
 
@@ -684,7 +675,11 @@ impl<'a> GethTraceBuilder<'a> {
                     used_opcodes: data.used_opcodes,
                     contract_size: data.contract_size,
                     out_of_gas: data.out_of_gas,
-                    keccak: data.keccak,
+                    keccak: if idx == 0 {
+                        core::mem::take(&mut keccak).into_iter().collect()
+                    } else {
+                        Vec::new()
+                    },
                     calls: vec![],
                 },
             });
@@ -754,6 +749,33 @@ fn erc7562_ignored_opcodes(configured: &[u8]) -> [bool; 256] {
         }
     }
     ignored
+}
+
+/// Returns the input of a `KECCAK256` step, zero-padded past the end of memory like geth's
+/// `GetMemoryCopyPadded`, which gives up when more than 1 MiB of padding is needed.
+/// <https://github.com/ethereum/go-ethereum/blob/00821e33e43686a30c4ddcb49991307dc5a4db0e/eth/tracers/native/erc7562.go#L447-L458>
+/// <https://github.com/ethereum/go-ethereum/blob/00821e33e43686a30c4ddcb49991307dc5a4db0e/eth/tracers/internal/util.go#L30-L49>
+fn erc7562_keccak_preimage(step: &CallTraceStep) -> Option<Bytes> {
+    const MEMORY_PAD_LIMIT: u64 = 1024 * 1024;
+    let [.., len, offset] = step.stack.as_deref()? else { return None };
+    let memory = step.memory.as_ref()?.as_bytes();
+    // geth reads both as uint64 and rejects negative int64 values
+    let (offset, len) = (offset.as_limbs()[0], len.as_limbs()[0]);
+    if offset > i64::MAX as u64 || len > i64::MAX as u64 {
+        return None;
+    }
+    let end = offset.checked_add(len)?;
+    let memory_len = memory.len() as u64;
+    if end.saturating_sub(memory_len) > MEMORY_PAD_LIMIT {
+        return None;
+    }
+    let mut preimage = vec![0; len as usize];
+    if offset < memory_len {
+        let copy_end = end.min(memory_len);
+        preimage[..(copy_end - offset) as usize]
+            .copy_from_slice(&memory[offset as usize..copy_end as usize]);
+    }
+    Some(preimage.into())
 }
 
 /// Returns true for the opcodes geth's ERC-7562 tracer treats as code access (`isEXT`).
