@@ -370,6 +370,14 @@ fn erc7562_call(op: u8, to: Address) -> Vec<u8> {
     code
 }
 
+/// `PUSH20 <address> <op>`
+fn erc7562_ext(op: u8, address: Address) -> Vec<u8> {
+    let mut code = vec![opcode::PUSH20];
+    code.extend_from_slice(address.as_slice());
+    code.push(op);
+    code
+}
+
 fn erc7562_used(ops: &[(u8, u64)]) -> HashMap<u8, u64> {
     ops.iter().copied().collect()
 }
@@ -416,6 +424,22 @@ fn test_geth_erc7562_gas_before_call() {
             (opcode::STATICCALL, 1),
             (opcode::STOP, 1)
         ])
+    );
+}
+
+// OP-051: `EXTCODESIZE` followed by `ISZERO` is allowed and is not reported.
+#[test]
+fn test_geth_erc7562_extcodesize_iszero() {
+    let mut code = erc7562_ext(opcode::EXTCODESIZE, ERC7562_NO_CODE);
+    code.extend_from_slice(&[opcode::ISZERO, opcode::POP]);
+    code.extend(erc7562_ext(opcode::EXTCODESIZE, ERC7562_NO_CODE_2));
+    code.push(opcode::POP);
+    code.extend(erc7562_ext(opcode::EXTCODEHASH, ERC7562_CHILD));
+    code.extend_from_slice(&[opcode::POP, opcode::STOP]);
+    let frame = trace_erc7562(Erc7562Config::default(), &code, &[opcode::STOP]);
+    assert_eq!(
+        frame.ext_code_access_info,
+        vec![format!("{ERC7562_NO_CODE_2:?}"), format!("{ERC7562_CHILD:?}")]
     );
 }
 

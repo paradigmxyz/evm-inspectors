@@ -1,6 +1,6 @@
 //! Geth trace builder
 use crate::tracing::{
-    types::{CallKind, CallTraceNode, CallTraceStepStackItem, TraceMemberOrder},
+    types::{CallKind, CallTraceNode, CallTraceStep, CallTraceStepStackItem, TraceMemberOrder},
     utils::load_account_code,
 };
 use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, format, vec, vec::Vec};
@@ -509,8 +509,8 @@ impl<'a> GethTraceBuilder<'a> {
         // frames, like geth's `OnOpcode` hook, because some rules depend on the previous opcode.
         let mut opcode_data: Vec<Erc7562OpcodeData> =
             self.nodes.iter().map(|_| Erc7562OpcodeData::default()).collect();
-        // The previous opcode, geth's `lastOpWithStack`
-        let mut last_op: Option<u8> = None;
+        // The previous step, geth's `lastOpWithStack`
+        let mut last_step: Option<&CallTraceStep> = None;
         // (node index, next index into the node's `ordering`)
         let mut walk = vec![(0usize, 0usize)];
         while let Some((idx, pos)) = walk.pop() {
@@ -536,7 +536,20 @@ impl<'a> GethTraceBuilder<'a> {
             let op = step.op.get();
 
             if matches!(op, opcode::RETURN | opcode::REVERT) {
-                last_op = None;
+                last_step = None;
+            }
+            let last_op = last_step.map(|last| last.op.get());
+
+            // [OP-051] EXTCODE* is reported once the next opcode is seen, unless that is
+            // `EXTCODESIZE` followed by `ISZERO`
+            if let (Some(last), Some(last_op)) = (last_step, last_op) {
+                if is_erc7562_ext(last_op)
+                    && !(last_op == opcode::EXTCODESIZE && op == opcode::ISZERO)
+                {
+                    if let Some(address) = erc7562_stack_address(last, 0) {
+                        ext_code_access_info.push(format!("{address:?}"));
+                    }
+                }
             }
 
             // [OP-012] GAS is only reported if the next opcode is not a call
@@ -599,11 +612,10 @@ impl<'a> GethTraceBuilder<'a> {
                 }
             }
 
-            if matches!(op, opcode::EXTCODESIZE | opcode::EXTCODECOPY | opcode::EXTCODEHASH) {
+            if is_erc7562_ext(op) {
                 if let Some(stack) = &step.stack {
                     if let Some(item) = stack.get(stack.len().saturating_sub(1)) {
                         let address = Address::from_word((*item).into());
-                        ext_code_access_info.push(format!("{address:?}"));
                         if let Entry::Vacant(e) = contract_size.entry(address) {
                             if let Ok(Some(account)) = db.basic_ref(address) {
                                 if account.code_hash != KECCAK_EMPTY {
@@ -641,7 +653,7 @@ impl<'a> GethTraceBuilder<'a> {
                 }
             }
 
-            last_op = Some(op);
+            last_step = Some(step);
         }
 
         let mut frames: Vec<PendingCallFrame<Erc7562Frame>> = Vec::with_capacity(self.nodes.len());
@@ -746,6 +758,18 @@ fn erc7562_ignored_opcodes(configured: &[u8]) -> [bool; 256] {
         }
     }
     ignored
+}
+
+/// Returns true for the opcodes geth's ERC-7562 tracer treats as code access (`isEXT`).
+const fn is_erc7562_ext(op: u8) -> bool {
+    matches!(op, opcode::EXTCODESIZE | opcode::EXTCODECOPY | opcode::EXTCODEHASH)
+}
+
+/// Returns the `n`th stack item from the top of `step`'s stack as an address.
+fn erc7562_stack_address(step: &CallTraceStep, n: usize) -> Option<Address> {
+    let stack = step.stack.as_deref()?;
+    let item = stack.get(stack.len().checked_sub(n + 1)?)?;
+    Some(Address::from_word((*item).into()))
 }
 
 /// Returns true for the opcodes geth's ERC-7562 tracer treats as calls (`isCall`).
