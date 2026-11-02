@@ -612,21 +612,17 @@ impl<'a> GethTraceBuilder<'a> {
                 }
             }
 
-            if is_erc7562_ext(op) {
-                if let Some(stack) = &step.stack {
-                    if let Some(item) = stack.get(stack.len().saturating_sub(1)) {
-                        let address = Address::from_word((*item).into());
-                        if let Entry::Vacant(e) = contract_size.entry(address) {
-                            if let Ok(Some(account)) = db.basic_ref(address) {
-                                if account.code_hash != KECCAK_EMPTY {
-                                    if let Ok(bytecode) = db.code_by_hash_ref(account.code_hash) {
-                                        e.insert(ContractSize {
-                                            contract_size: bytecode.original_bytes().len() as u64,
-                                            opcode: op,
-                                        });
-                                    }
-                                }
-                            }
+            // [OP-041] The code size of each address accessed with EXTCODE* or called, including
+            // addresses without code, recorded with the first opcode that accessed it
+            if is_erc7562_ext(op) || is_erc7562_call(op) {
+                let n = if is_erc7562_ext(op) { 0 } else { 1 };
+                if let Some(address) = erc7562_stack_address(step, n) {
+                    if let Entry::Vacant(entry) = contract_size.entry(address) {
+                        if let Ok(account) = db.basic_ref(address) {
+                            let size = account
+                                .and_then(|account| load_account_code(&db, &account))
+                                .map_or(0, |code| code.len());
+                            entry.insert(ContractSize { contract_size: size as u64, opcode: op });
                         }
                     }
                 }

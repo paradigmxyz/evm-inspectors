@@ -7,7 +7,7 @@ use crate::utils::deploy_contract;
 use alloy_primitives::{address, hex, map::HashMap, Address, Bytes, TxKind, B256, U256};
 use alloy_rpc_types_eth::TransactionInfo;
 use alloy_rpc_types_trace::geth::{
-    erc7562::{Erc7562Config, Erc7562Frame},
+    erc7562::{ContractSize, Erc7562Config, Erc7562Frame},
     mux::MuxConfig,
     CallConfig, FlatCallConfig, GethDebugBuiltInTracerType, GethDebugTracerConfig,
     GethDebugTracerType, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace,
@@ -440,6 +440,26 @@ fn test_geth_erc7562_extcodesize_iszero() {
     assert_eq!(
         frame.ext_code_access_info,
         vec![format!("{ERC7562_NO_CODE_2:?}"), format!("{ERC7562_CHILD:?}")]
+    );
+}
+
+// OP-041: `contractSize` covers the targets of CALL-type opcodes and addresses without code.
+#[test]
+fn test_geth_erc7562_contract_size() {
+    let mut code = erc7562_ext(opcode::EXTCODESIZE, ERC7562_NO_CODE);
+    code.push(opcode::POP);
+    code.extend(erc7562_call(opcode::CALL, ERC7562_CHILD));
+    code.extend(erc7562_call(opcode::STATICCALL, ERC7562_NO_CODE_2));
+    code.push(opcode::STOP);
+    let frame = trace_erc7562(Erc7562Config::default(), &code, &[opcode::STOP]);
+    let size = |contract_size, opcode| ContractSize { contract_size, opcode };
+    assert_eq!(
+        frame.contract_size,
+        HashMap::from_iter([
+            (ERC7562_NO_CODE, size(0, opcode::EXTCODESIZE)),
+            (ERC7562_CHILD, size(1, opcode::CALL)),
+            (ERC7562_NO_CODE_2, size(0, opcode::STATICCALL)),
+        ])
     );
 }
 
