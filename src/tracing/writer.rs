@@ -267,6 +267,9 @@ impl<W: Write> TraceWriter<W> {
                 "{trace_kind_style}{CALL}new{trace_kind_style:#} {label}@{address}",
                 label = trace.decoded_label("<unknown>")
             )?;
+            if !trace.value.is_zero() {
+                write!(self.writer, "{{value: {}}}", trace.value)?;
+            }
             if self.config.write_bytecodes {
                 write!(self.writer, "({})", trace.data)?;
             }
