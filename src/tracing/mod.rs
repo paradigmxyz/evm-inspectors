@@ -21,7 +21,9 @@ use revm::{
     },
     inspector::JournalExt,
     interpreter::{
-        interpreter_types::{Immediates, Jumps, LoopControl, ReturnData, RuntimeFlag},
+        interpreter_types::{
+            Immediates, Jumps, LegacyBytecode, LoopControl, ReturnData, RuntimeFlag,
+        },
         CallInput, CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome,
         InstructionResult, Interpreter, InterpreterResult,
     },
@@ -446,6 +448,30 @@ impl TracingInspector {
         }
     }
 
+    /// Records the opcode that halted the current call, if it halted because the opcode is
+    /// unknown, not activated in the current spec, or the designated invalid opcode `0xFE`.
+    ///
+    /// Invoked on [Inspector::step_end] once the interpreter has an action.
+    #[cold]
+    fn record_halt_opcode(&mut self, interp: &mut Interpreter) {
+        if !matches!(
+            interp.bytecode.instruction_result(),
+            Some(
+                InstructionResult::NotActivated
+                    | InstructionResult::OpcodeNotFound
+                    | InstructionResult::InvalidFEOpcode
+            )
+        ) {
+            return;
+        }
+        // The interpreter advances the pc before executing an instruction, and these halts do not
+        // move it further, so the halting opcode is at `pc - 1`.
+        let Some(pc) = interp.bytecode.pc().checked_sub(1) else { return };
+        if let Some(&op) = interp.bytecode.bytecode_slice().get(pc) {
+            self.last_trace().trace.halt_opcode = Some(op);
+        }
+    }
+
     /// Starts tracking a step
     ///
     /// Invoked on [Inspector::step]
@@ -800,6 +826,9 @@ where
     fn step_end(&mut self, interp: &mut Interpreter, context: &mut CTX) {
         if self.config.record_steps {
             self.fill_step_on_step_end(interp, context);
+        }
+        if interp.bytecode.is_end() {
+            self.record_halt_opcode(interp);
         }
         self.budget.check_and_halt(context, interp);
     }

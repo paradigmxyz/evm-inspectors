@@ -9,7 +9,7 @@ use alloc::{format, string::String, vec::Vec};
 use alloy_primitives::{address, hex, map::HashMap, Address, B256, U256};
 use anstyle::{AnsiColor, Color, Style};
 use colorchoice::ColorChoice;
-use revm::interpreter::InstructionResult;
+use revm::{bytecode::opcode::OpCode, interpreter::InstructionResult};
 use std::io::{self, Write};
 
 const CHEATCODE_ADDRESS: Address = address!("7109709ECfa91a80626fF3989D68f67F5b1DD12D");
@@ -420,10 +420,17 @@ impl<W: Write> TraceWriter<W> {
     fn write_trace_footer(&mut self, trace: &CallTrace) -> io::Result<()> {
         write!(
             self.writer,
-            "{style}{RETURN}[{status:?}]{style:#}",
+            "{style}{RETURN}[{status:?}",
             style = self.trace_style(trace),
             status = trace.status.unwrap_or(InstructionResult::Stop),
         )?;
+        if let Some(op) = trace.halt_opcode {
+            match OpCode::new(op) {
+                Some(name) => write!(self.writer, ": {name} (0x{op:02x})")?,
+                None => write!(self.writer, ": 0x{op:02x}")?,
+            }
+        }
+        write!(self.writer, "]{style:#}", style = self.trace_style(trace))?;
 
         if let Some(decoded) = trace.decoded_return_data() {
             write!(self.writer, " ")?;

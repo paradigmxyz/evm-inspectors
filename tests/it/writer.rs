@@ -89,6 +89,64 @@ fn test_trace_printing() {
     call(Counter::writeMultipleSlotsCall {}.abi_encode());
 }
 
+/// A frame that halts on an unknown, not activated or `0xFE` opcode names that opcode, whether or
+/// not steps are recorded, and only on the frame that halted.
+#[test]
+fn halt_opcode() {
+    // CALL(gas, 0x42, 0, 0, 0, 0, 0) STOP
+    let caller_code = bytes!("5f5f5f5f5f7300000000000000000000000000000000000000425af100");
+    let cases = [
+        // PUSH0 CLZ STOP: CLZ is not activated before Osaka.
+        (bytes!("5f1e00"), SpecId::PRAGUE, 0x1e, "[NotActivated: CLZ (0x1e)]"),
+        // 0x0C is not an opcode.
+        (bytes!("0c"), SpecId::OSAKA, 0x0c, "[OpcodeNotFound: 0x0c]"),
+        // INVALID.
+        (bytes!("fe"), SpecId::OSAKA, 0xfe, "[InvalidFEOpcode: INVALID (0xfe)]"),
+    ];
+    for (code, spec, op, footer) in cases {
+        for config in [TracingInspectorConfig::all(), TracingInspectorConfig::none()] {
+            let callee = Address::with_last_byte(0x42);
+            let caller = Address::with_last_byte(0x41);
+            let mut db = CacheDB::new(EmptyDB::default());
+            for (address, code) in [(caller, caller_code.clone()), (callee, code.clone())] {
+                db.insert_account_info(
+                    address,
+                    revm::state::AccountInfo::default()
+                        .with_code(revm::bytecode::Bytecode::new_raw(code)),
+                );
+            }
+            let mut evm = Context::mainnet()
+                .with_db(db)
+                .modify_cfg_chained(|cfg| cfg.spec = spec)
+                .build_mainnet_with_inspector(TracingInspector::new(config));
+            let result = evm
+                .inspect_tx(TxEnv {
+                    gas_limit: 1_000_000,
+                    kind: TransactTo::Call(caller),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(result.result.is_success(), "{result:#?}");
+
+            let tracer = evm.into_inspector();
+            let nodes = tracer.traces().nodes();
+            assert_eq!(nodes[0].trace.halt_opcode, None);
+            assert_eq!(nodes[1].trace.halt_opcode, Some(op));
+
+            let s = write_traces(&tracer);
+            let expected = format!(
+                "  [{gas0}] {caller}::fallback()\n    \
+                 ├─ [{gas1}] {callee}::fallback()\n    \
+                 │   └─ ← {footer}\n    \
+                 └─ ← [Stop]\n",
+                gas0 = nodes[0].trace.gas_used,
+                gas1 = nodes[1].trace.gas_used,
+            );
+            assert_eq!(s, expected, "{spec:?}");
+        }
+    }
+}
+
 #[test]
 fn deploy_fail() {
     let base_path = &Path::new(OUT_DIR).join("deploy_fail");

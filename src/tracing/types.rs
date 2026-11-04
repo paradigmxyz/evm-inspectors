@@ -112,6 +112,14 @@ pub struct CallTrace {
     pub gas_refund_counter: u64,
     /// The final status of the call.
     pub status: Option<InstructionResult>,
+    /// The opcode byte that halted the call, if [`Self::status`] is
+    /// [`InstructionResult::NotActivated`], [`InstructionResult::OpcodeNotFound`] or
+    /// [`InstructionResult::InvalidFEOpcode`].
+    ///
+    /// Recorded independently of
+    /// [`TracingInspectorConfig::record_steps`](crate::tracing::TracingInspectorConfig::record_steps).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub halt_opcode: Option<u8>,
     /// Opcode-level execution steps.
     pub steps: Vec<CallTraceStep>,
     /// The deltas recorded for [`Self::steps`], in step order.
