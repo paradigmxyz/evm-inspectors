@@ -26,7 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: ["stable", "nightly", "1.94"] # MSRV
+        rust: ["stable", "nightly-2026-10-31", "1.94"] # MSRV
         flags: ["", "--all-features"]
     steps:
       - name: Secure runner
@@ -94,7 +94,7 @@ jobs:
           persist-credentials: false
       - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-10-31
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -117,7 +117,7 @@ jobs:
           persist-credentials: false
       - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-10-31
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
