@@ -7,9 +7,11 @@ use crate::utils::deploy_contract;
 use alloy_primitives::{address, hex, map::HashMap, Address, Bytes, TxKind, B256, U256};
 use alloy_rpc_types_eth::TransactionInfo;
 use alloy_rpc_types_trace::geth::{
-    erc7562::Erc7562Config, mux::MuxConfig, CallConfig, FlatCallConfig, GethDebugBuiltInTracerType,
-    GethDebugTracerConfig, GethDebugTracerType, GethDebugTracingOptions, GethDefaultTracingOptions,
-    GethTrace, PreStateConfig, PreStateFrame,
+    erc7562::{ContractSize, Erc7562Config, Erc7562Frame},
+    mux::MuxConfig,
+    CallConfig, FlatCallConfig, GethDebugBuiltInTracerType, GethDebugTracerConfig,
+    GethDebugTracerType, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace,
+    PreStateConfig, PreStateFrame,
 };
 use revm::{
     bytecode::{opcode, Bytecode},
@@ -312,6 +314,191 @@ fn test_geth_erc7562_tracer() {
         }
         _ => panic!("Expected Erc7562Tracer"),
     }
+}
+
+const ERC7562_ROOT: Address = address!("1000000000000000000000000000000000000001");
+const ERC7562_CHILD: Address = address!("1000000000000000000000000000000000000003");
+const ERC7562_NO_CODE: Address = address!("000000000000000000000000000000000000dead");
+const ERC7562_NO_CODE_2: Address = address!("000000000000000000000000000000000000beef");
+
+/// Calls [`ERC7562_ROOT`] running `code`, with `child_code` deployed at [`ERC7562_CHILD`].
+fn trace_erc7562(config: Erc7562Config, code: &[u8], child_code: &[u8]) -> Erc7562Frame {
+    let caller = address!("1000000000000000000000000000000000000002");
+    let context =
+        Context::mainnet().with_db(CacheDB::<EmptyDB>::default()).modify_db_chained(|db| {
+            for (address, code) in [(ERC7562_ROOT, code), (ERC7562_CHILD, child_code)] {
+                let code = Bytecode::new_raw(Bytes::copy_from_slice(code));
+                db.insert_account_info(
+                    address,
+                    AccountInfo {
+                        code_hash: code.hash_slow(),
+                        code: Some(code),
+                        ..Default::default()
+                    },
+                );
+            }
+        });
+    let opts = GethDebugTracingOptions::erc7562_tracer(config);
+    let mut inspector = DebugInspector::new(opts).unwrap();
+    let mut evm = context.build_mainnet().with_inspector(&mut inspector);
+    let res = evm
+        .inspect_tx(TxEnv {
+            caller,
+            gas_limit: 1_000_000,
+            gas_price: 0,
+            kind: TransactTo::Call(ERC7562_ROOT),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(res.result.is_success(), "{res:#?}");
+    let (ctx, inspector) = evm.ctx_inspector();
+    let tx_env = ctx.tx().clone();
+    let block_env = ctx.block().clone();
+    match inspector.get_result(None, &tx_env, &block_env, &res, ctx.db_mut()).unwrap() {
+        GethTrace::Erc7562Tracer(frame) => frame,
+        trace => panic!("expected an erc7562 trace, got {trace:?}"),
+    }
+}
+
+/// `PUSH1 0 (x5) PUSH20 <to> GAS CALL POP`, or `PUSH1 0 (x4) PUSH20 <to> GAS STATICCALL POP`
+fn erc7562_call(op: u8, to: Address) -> Vec<u8> {
+    let args = if op == opcode::STATICCALL { 4 } else { 5 };
+    let mut code = [opcode::PUSH1, 0].repeat(args);
+    code.push(opcode::PUSH20);
+    code.extend_from_slice(to.as_slice());
+    code.extend_from_slice(&[opcode::GAS, op, opcode::POP]);
+    code
+}
+
+/// `PUSH20 <address> <op>`
+fn erc7562_ext(op: u8, address: Address) -> Vec<u8> {
+    let mut code = vec![opcode::PUSH20];
+    code.extend_from_slice(address.as_slice());
+    code.push(op);
+    code
+}
+
+fn erc7562_used(ops: &[(u8, u64)]) -> HashMap<u8, u64> {
+    ops.iter().copied().collect()
+}
+
+// geth only counts opcodes outside its default ignore list (PUSH*, DUP*, SWAP*, POP and simple
+// arithmetic):
+// <https://github.com/ethereum/go-ethereum/blob/00821e33e43686a30c4ddcb49991307dc5a4db0e/eth/tracers/native/erc7562.go#L519-L537>
+#[test]
+fn test_geth_erc7562_default_ignored_opcodes() {
+    // PUSH1 1 PUSH1 2 ADD DUP1 SWAP1 POP POP STOP
+    let code = hex!("60016002018090505000");
+    let frame = trace_erc7562(Erc7562Config::default(), &code, &[]);
+    assert_eq!(frame.used_opcodes, erc7562_used(&[(opcode::STOP, 1)]));
+}
+
+// A configured ignore list replaces the default one and only affects `usedOpcodes`; geth still
+// records storage access for ignored opcodes.
+#[test]
+fn test_geth_erc7562_custom_ignored_opcodes() {
+    // PUSH1 0 SLOAD POP STOP
+    let code = hex!("6000545000");
+    let config = Erc7562Config { ignored_opcodes: vec![opcode::SLOAD], ..Default::default() };
+    let frame = trace_erc7562(config, &code, &[]);
+    assert_eq!(
+        frame.used_opcodes,
+        erc7562_used(&[(opcode::PUSH1, 1), (opcode::POP, 1), (opcode::STOP, 1)])
+    );
+    assert_eq!(frame.accessed_slots.reads, HashMap::from_iter([(B256::ZERO, vec![B256::ZERO])]));
+}
+
+// OP-012: GAS is allowed right before a CALL-type opcode and is not reported then.
+#[test]
+fn test_geth_erc7562_gas_before_call() {
+    let mut code = vec![opcode::GAS, opcode::POP];
+    code.extend(erc7562_call(opcode::CALL, ERC7562_NO_CODE));
+    code.extend(erc7562_call(opcode::STATICCALL, ERC7562_NO_CODE_2));
+    code.push(opcode::STOP);
+    let frame = trace_erc7562(Erc7562Config::default(), &code, &[]);
+    assert_eq!(
+        frame.used_opcodes,
+        erc7562_used(&[
+            (opcode::GAS, 1),
+            (opcode::CALL, 1),
+            (opcode::STATICCALL, 1),
+            (opcode::STOP, 1)
+        ])
+    );
+}
+
+// OP-051: `EXTCODESIZE` followed by `ISZERO` is allowed and is not reported.
+#[test]
+fn test_geth_erc7562_extcodesize_iszero() {
+    let mut code = erc7562_ext(opcode::EXTCODESIZE, ERC7562_NO_CODE);
+    code.extend_from_slice(&[opcode::ISZERO, opcode::POP]);
+    code.extend(erc7562_ext(opcode::EXTCODESIZE, ERC7562_NO_CODE_2));
+    code.push(opcode::POP);
+    code.extend(erc7562_ext(opcode::EXTCODEHASH, ERC7562_CHILD));
+    code.extend_from_slice(&[opcode::POP, opcode::STOP]);
+    let frame = trace_erc7562(Erc7562Config::default(), &code, &[opcode::STOP]);
+    assert_eq!(
+        frame.ext_code_access_info,
+        vec![format!("{ERC7562_NO_CODE_2:?}"), format!("{ERC7562_CHILD:?}")]
+    );
+}
+
+// OP-041: `contractSize` covers the targets of CALL-type opcodes and addresses without code.
+#[test]
+fn test_geth_erc7562_contract_size() {
+    let mut code = erc7562_ext(opcode::EXTCODESIZE, ERC7562_NO_CODE);
+    code.push(opcode::POP);
+    code.extend(erc7562_call(opcode::CALL, ERC7562_CHILD));
+    code.extend(erc7562_call(opcode::STATICCALL, ERC7562_NO_CODE_2));
+    code.push(opcode::STOP);
+    let frame = trace_erc7562(Erc7562Config::default(), &code, &[opcode::STOP]);
+    let size = |contract_size, opcode| ContractSize { contract_size, opcode };
+    assert_eq!(
+        frame.contract_size,
+        HashMap::from_iter([
+            (ERC7562_NO_CODE, size(0, opcode::EXTCODESIZE)),
+            (ERC7562_CHILD, size(1, opcode::CALL)),
+            (ERC7562_NO_CODE_2, size(0, opcode::STATICCALL)),
+        ])
+    );
+}
+
+// Keccak preimages of the whole transaction are deduplicated, sorted and stored on the root frame.
+#[test]
+fn test_geth_erc7562_keccak_preimages() {
+    // KECCAK256(0, 32) POP, twice
+    let mut code = hex!("602060002050602060002050").to_vec();
+    code.extend(erc7562_call(opcode::CALL, ERC7562_CHILD));
+    code.push(opcode::STOP);
+    // KECCAK256(0, 32) POP KECCAK256(0, 0) POP STOP
+    let child = hex!("60206000205060006000205000");
+    let frame = trace_erc7562(Erc7562Config::default(), &code, &child);
+    assert_eq!(frame.keccak, vec![Bytes::new(), Bytes::from(vec![0; 32])]);
+    assert_eq!(frame.calls.len(), 1);
+    assert!(frame.calls[0].keccak.is_empty());
+}
+
+// Compares with the output of geth's erc7562Tracer
+// (go-ethereum 00821e33e43686a30c4ddcb49991307dc5a4db0e) for the same transaction:
+// `testdata/erc7562/geth_parity.json`.
+#[test]
+fn test_geth_erc7562_parity() {
+    let mut code = vec![opcode::GAS, opcode::POP];
+    code.extend(erc7562_ext(opcode::EXTCODESIZE, ERC7562_NO_CODE));
+    code.extend_from_slice(&[opcode::ISZERO, opcode::POP]);
+    code.extend(erc7562_ext(opcode::EXTCODEHASH, ERC7562_CHILD));
+    code.push(opcode::POP);
+    code.extend(hex!("602060002050602060002050"));
+    code.extend(erc7562_call(opcode::CALL, ERC7562_CHILD));
+    code.extend(erc7562_call(opcode::STATICCALL, ERC7562_NO_CODE_2));
+    code.extend(hex!("6000545000"));
+    let child = hex!("6020600020506000600020505a5000");
+
+    let frame = trace_erc7562(Erc7562Config::default(), &code, &child);
+    let actual = serde_json::to_value(&frame).unwrap();
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("../../testdata/erc7562/geth_parity.json")).unwrap();
+    assert_eq!(actual, expected);
 }
 
 fn trace_contract(
