@@ -267,6 +267,11 @@ impl<W: Write> TraceWriter<W> {
                 "{trace_kind_style}{CALL}new{trace_kind_style:#} {label}@{address}",
                 label = trace.decoded_label("<unknown>")
             )?;
+            if let Some(DecodedCallData { args, .. }) = trace.decoded_call_data() {
+                if !args.is_empty() {
+                    write!(self.writer, "({})", args.join(", "))?;
+                }
+            }
             if self.config.write_bytecodes {
                 write!(self.writer, "({})", trace.data)?;
             }
