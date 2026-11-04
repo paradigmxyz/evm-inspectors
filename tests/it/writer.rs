@@ -359,6 +359,165 @@ fn test_receive_vs_fallback_empty_calldata() {
     );
 }
 
+/// Account that delegates to [`DELEGATION_TARGET`] through an EIP-7702 designator.
+const DELEGATING_ACCOUNT: Address = address!("0x00000000000000000000000000000000000000a0");
+/// Code that returns 42.
+const DELEGATION_TARGET: Address = address!("0x00000000000000000000000000000000000000b0");
+/// Code that CALLs [`DELEGATING_ACCOUNT`].
+const DELEGATION_CALLER: Address = address!("0x00000000000000000000000000000000000000c1");
+/// Code that DELEGATECALLs [`DELEGATING_ACCOUNT`].
+const DELEGATION_DELEGATECALLER: Address = address!("0x00000000000000000000000000000000000000c2");
+
+fn delegation_db(delegate: bool) -> CacheDB<EmptyDB> {
+    use revm::{bytecode::Bytecode, state::AccountInfo};
+
+    let code = |code: Vec<u8>| AccountInfo::default().with_code(Bytecode::new_raw(code.into()));
+    let mut db = CacheDB::new(EmptyDB::default());
+    // PUSH1 42, PUSH0, MSTORE, PUSH1 32, PUSH0, RETURN
+    db.insert_account_info(DELEGATION_TARGET, code(hex!("602a5f5260205ff3").to_vec()));
+    if delegate {
+        db.insert_account_info(
+            DELEGATING_ACCOUNT,
+            AccountInfo::default().with_code(Bytecode::new_eip7702(DELEGATION_TARGET)),
+        );
+    }
+    // CALL(GAS, account, 0, 0, 0, 0, 0), STOP
+    db.insert_account_info(
+        DELEGATION_CALLER,
+        code([&hex!("5f5f5f5f5f73")[..], DELEGATING_ACCOUNT.as_slice(), &hex!("5af100")].concat()),
+    );
+    // DELEGATECALL(GAS, account, 0, 0, 0, 0), STOP
+    db.insert_account_info(
+        DELEGATION_DELEGATECALLER,
+        code([&hex!("5f5f5f5f73")[..], DELEGATING_ACCOUNT.as_slice(), &hex!("5af400")].concat()),
+    );
+    db
+}
+
+fn delegation_tx(to: Address) -> TxEnv {
+    TxEnv::builder().to(to).gas_limit(100_000).build_fill()
+}
+
+fn delegation_trace(db: CacheDB<EmptyDB>, tx: TxEnv) -> TracingInspector {
+    let mut evm = Context::mainnet()
+        .modify_cfg_chained(|cfg| cfg.set_spec_and_mainnet_gas_params(SpecId::PRAGUE))
+        .with_db(db)
+        .build_mainnet_with_inspector(TracingInspector::new(TracingInspectorConfig::all()));
+    let result = evm.inspect_tx(tx).unwrap();
+    assert!(result.result.is_success(), "{result:#?}");
+    evm.inspector
+}
+
+/// Calls that run an EIP-7702 delegated account's code name the delegate.
+///
+/// See <https://github.com/foundry-rs/foundry/issues/9800>.
+#[test]
+fn test_eip7702_delegated_call() {
+    let cases: [(Address, &str); 4] = [
+        (
+            DELEGATING_ACCOUNT,
+            "  [16] 0x00000000000000000000000000000000000000a0::fallback() [delegated to 0x00000000000000000000000000000000000000B0]
+    └─ ← [Return] 0x000000000000000000000000000000000000000000000000000000000000002a
+",
+        ),
+        (
+            DELEGATION_CALLER,
+            "  [5231] 0x00000000000000000000000000000000000000C1::fallback()
+    ├─ [16] 0x00000000000000000000000000000000000000a0::fallback() [delegated to 0x00000000000000000000000000000000000000B0]
+    │   └─ ← [Return] 0x000000000000000000000000000000000000000000000000000000000000002a
+    └─ ← [Stop]
+",
+        ),
+        (
+            DELEGATION_DELEGATECALLER,
+            "  [5229] 0x00000000000000000000000000000000000000c2::fallback()
+    ├─ [16] 0x00000000000000000000000000000000000000a0::fallback() [delegatecall] [delegated to 0x00000000000000000000000000000000000000B0]
+    │   └─ ← [Return] 0x000000000000000000000000000000000000000000000000000000000000002a
+    └─ ← [Stop]
+",
+        ),
+        (
+            DELEGATION_TARGET,
+            "  [16] 0x00000000000000000000000000000000000000B0::fallback()
+    └─ ← [Return] 0x000000000000000000000000000000000000000000000000000000000000002a
+",
+        ),
+    ];
+    for (to, expected) in cases {
+        let tracer = delegation_trace(delegation_db(true), delegation_tx(to));
+        let nodes = tracer.traces().nodes();
+        let delegated = nodes.iter().map(|node| node.trace.delegated_to).collect::<Vec<_>>();
+        let expected_delegated = nodes
+            .iter()
+            .map(|node| (node.trace.address == DELEGATING_ACCOUNT).then_some(DELEGATION_TARGET))
+            .collect::<Vec<_>>();
+        assert_eq!(delegated, expected_delegated);
+        assert_eq!(write_traces(&tracer), expected, "to {to}");
+    }
+}
+
+/// A delegation set by the transaction's own authorization list is visible to its call.
+#[test]
+fn test_eip7702_delegation_from_authorization_list() {
+    use revm::context_interface::transaction::{
+        Authorization, RecoveredAuthority, RecoveredAuthorization,
+    };
+
+    for (delegate, expected) in
+        [(DELEGATION_TARGET, Some(DELEGATION_TARGET)), (Address::ZERO, None)]
+    {
+        let tx = TxEnv::builder()
+            .to(DELEGATING_ACCOUNT)
+            .gas_limit(100_000)
+            .authorization_list_recovered(vec![RecoveredAuthorization::new_unchecked(
+                Authorization { chain_id: U256::from(1), address: delegate, nonce: 0 },
+                RecoveredAuthority::Valid(DELEGATING_ACCOUNT),
+            )])
+            .build_fill();
+        let tracer = delegation_trace(delegation_db(false), tx);
+        assert_eq!(tracer.traces().nodes()[0].trace.delegated_to, expected);
+    }
+}
+
+/// Recording the delegate reads only accounts revm has already loaded, so tracing does not change
+/// gas used or state, including for cold accounts.
+#[test]
+fn test_eip7702_delegation_tracing_does_not_change_execution() {
+    use revm::ExecuteEvm;
+
+    for to in [DELEGATING_ACCOUNT, DELEGATION_CALLER, DELEGATION_DELEGATECALLER] {
+        let mut plain = Context::mainnet()
+            .modify_cfg_chained(|cfg| cfg.set_spec_and_mainnet_gas_params(SpecId::PRAGUE))
+            .with_db(delegation_db(true))
+            .build_mainnet();
+        let mut traced = Context::mainnet()
+            .modify_cfg_chained(|cfg| cfg.set_spec_and_mainnet_gas_params(SpecId::PRAGUE))
+            .with_db(delegation_db(true))
+            .build_mainnet_with_inspector(TracingInspector::new(TracingInspectorConfig::all()));
+
+        let plain = plain.transact(delegation_tx(to)).unwrap();
+        let traced = traced.inspect_tx(delegation_tx(to)).unwrap();
+        assert!(plain.result.is_success());
+        assert_eq!(plain.result, traced.result, "to {to}");
+        assert_eq!(plain.state, traced.state, "to {to}");
+        assert!(traced.state.contains_key(&DELEGATION_TARGET), "to {to}");
+    }
+}
+
+/// Traces serialized before `delegated_to` existed still deserialize.
+#[cfg(feature = "serde")]
+#[test]
+fn test_eip7702_delegated_to_serde_default() {
+    use revm_inspectors::tracing::types::CallTrace;
+
+    let trace = CallTrace { delegated_to: Some(DELEGATION_TARGET), ..Default::default() };
+    let mut json = serde_json::to_value(&trace).unwrap();
+    assert_eq!(json["delegated_to"], serde_json::json!(DELEGATION_TARGET));
+    json.as_object_mut().unwrap().remove("delegated_to");
+    let old: CallTrace = serde_json::from_value(json).unwrap();
+    assert_eq!(old, CallTrace::default());
+}
+
 /// Test that non-empty calldata (< 4 bytes) with successful call shows "fallback".
 #[test]
 fn test_fallback_short_calldata() {
