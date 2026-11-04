@@ -290,6 +290,82 @@ fn assert_traces(
     }
 }
 
+/// The selfdestruct footer names the beneficiary and the value sent to it.
+#[test]
+fn test_selfdestruct_beneficiary() {
+    use revm::{bytecode::Bytecode, state::AccountInfo};
+
+    let destructor = address!("0x00000000000000000000000000000000000000d0");
+    let beneficiary = address!("0x00000000000000000000000000000000000000e0");
+    let caller = address!("0x00000000000000000000000000000000000000c0");
+    // PUSH20 beneficiary, SELFDESTRUCT
+    let destruct = [&hex!("73")[..], beneficiary.as_slice(), &hex!("ff")].concat();
+    // CALL(GAS, destructor, 0, 0, 0, 0, 0), STOP
+    let call = [&hex!("5f5f5f5f5f73")[..], destructor.as_slice(), &hex!("5af100")].concat();
+
+    let cases: [(SpecId, Address, u64, &str); 4] = [
+        (
+            SpecId::CANCUN,
+            destructor,
+            1000,
+            "  [32603] 0x00000000000000000000000000000000000000d0::fallback()
+    └─ ← [SelfDestruct] beneficiary: 0x00000000000000000000000000000000000000E0, value: 1000
+",
+        ),
+        (
+            SpecId::SHANGHAI,
+            destructor,
+            1000,
+            "  [32603] 0x00000000000000000000000000000000000000d0::fallback()
+    └─ ← [SelfDestruct] beneficiary: 0x00000000000000000000000000000000000000E0, value: 1000
+",
+        ),
+        (
+            SpecId::CANCUN,
+            destructor,
+            0,
+            "  [7603] 0x00000000000000000000000000000000000000d0::fallback()
+    └─ ← [SelfDestruct] beneficiary: 0x00000000000000000000000000000000000000E0, value: 0
+",
+        ),
+        (
+            SpecId::CANCUN,
+            caller,
+            1000,
+            "  [35218] 0x00000000000000000000000000000000000000C0::fallback()
+    ├─ [32603] 0x00000000000000000000000000000000000000d0::fallback()
+    │   └─ ← [SelfDestruct] beneficiary: 0x00000000000000000000000000000000000000E0, value: 1000
+    └─ ← [Stop]
+",
+        ),
+    ];
+    for (spec, to, balance, expected) in cases {
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            destructor,
+            AccountInfo {
+                balance: U256::from(balance),
+                ..AccountInfo::default().with_code(Bytecode::new_raw(destruct.clone().into()))
+            },
+        );
+        db.insert_account_info(
+            caller,
+            AccountInfo::default().with_code(Bytecode::new_raw(call.clone().into())),
+        );
+        let mut evm = Context::mainnet()
+            .modify_cfg_chained(|cfg| cfg.set_spec_and_mainnet_gas_params(spec))
+            .with_db(db)
+            .build_mainnet_with_inspector(TracingInspector::new(TracingInspectorConfig::all()));
+        let result = evm
+            .inspect_tx(
+                TxEnv::builder().to(to).gas_limit(100_000).gas_priority_fee(None).build_fill(),
+            )
+            .unwrap();
+        assert!(result.result.is_success(), "{result:#?}");
+        assert_eq!(write_traces(&evm.inspector), expected, "{spec:?} to {to}");
+    }
+}
+
 /// Test that short calldata (< 4 bytes) with nonzero value shows "receive" instead of "fallback".
 ///
 /// Regression test for https://github.com/foundry-rs/foundry/issues/12962

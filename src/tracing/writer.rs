@@ -425,6 +425,14 @@ impl<W: Write> TraceWriter<W> {
             status = trace.status.unwrap_or(InstructionResult::Stop),
         )?;
 
+        if let Some(beneficiary) = trace.selfdestruct_refund_target {
+            write!(
+                self.writer,
+                " beneficiary: {beneficiary}, value: {value}",
+                value = trace.selfdestruct_transferred_value.unwrap_or_default(),
+            )?;
+        }
+
         if let Some(decoded) = trace.decoded_return_data() {
             write!(self.writer, " ")?;
             return self.writer.write_all(decoded.as_bytes());
