@@ -3,6 +3,7 @@ use crate::tracing::{
 };
 #[cfg(feature = "js-tracer")]
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use alloy_rpc_types_eth::TransactionInfo;
 use alloy_rpc_types_trace::geth::{
     erc7562::Erc7562Config, mux::MuxConfig, CallConfig, FourByteFrame, GethDebugBuiltInTracerType,
@@ -224,6 +225,13 @@ impl DebugInspector {
     }
 
     /// Should be invoked after each transaction to obtain the resulting [`GethTrace`].
+    ///
+    /// Call traces, including those in a mux trace, recover the transaction root when runtime
+    /// gas charging halts before revm invokes the call/create hooks. Recovered roots report
+    /// `out of gas`; fork-specific fields remain omitted when the execution spec was not recorded.
+    ///
+    /// The default struct logger moves the recorded stack snapshots into the result, so calling
+    /// this again before [`Self::fuse`] returns struct logs without stacks.
     pub fn get_result<DB: DatabaseRef>(
         &mut self,
         tx_context: Option<TransactionContext>,
@@ -245,6 +253,7 @@ impl DebugInspector {
         let res = match self {
             Self::FourByte(inspector) => FourByteFrame::from(&*inspector).into(),
             Self::CallTracer(inspector, config) => {
+                inspector.recover_runtime_oog_root(tx_env, &res.result);
                 inspector.set_transaction_gas_limit(tx_env.gas_limit());
                 inspector.set_transaction_caller(tx_env.caller());
                 inspector
@@ -269,7 +278,7 @@ impl DebugInspector {
             }
             .into(),
             Self::Mux(inspector, _) => {
-                inspector.set_transaction_gas_limit(tx_env.gas_limit());
+                inspector.finalize_transaction(tx_env, &res.result);
                 inspector
                     .try_into_mux_frame(res, db, tx_info)
                     .map_err(DebugInspectorError::Database)?
@@ -281,6 +290,7 @@ impl DebugInspector {
                 inspector
                     .clone()
                     .into_parity_builder()
+                    .with_transaction_gas_used(res.result.tx_gas_used())
                     .into_localized_transaction_traces(tx_info)
                     .into()
             }
@@ -295,12 +305,27 @@ impl DebugInspector {
             Self::Default(inspector, config) => {
                 inspector.set_transaction_gas_limit(tx_env.gas_limit());
                 inspector.set_transaction_caller(tx_env.caller());
+                // Move the stack snapshots into the struct logs instead of copying them.
+                let mut stacks = config.is_stack_enabled().then(|| {
+                    inspector
+                        .traces_mut()
+                        .nodes_mut()
+                        .iter_mut()
+                        .map(|node| {
+                            let stacks = node.trace.steps.iter_mut().map(|step| step.stack.take());
+                            stacks.collect::<Vec<_>>().into_iter()
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let gas = *res.result.gas();
                 inspector
                     .geth_builder()
-                    .geth_traces_with_result_gas(
-                        *res.result.gas(),
+                    .geth_traces_inner(
+                        gas.tx_gas_used(),
+                        Some(gas),
                         res.result.output().unwrap_or_default().clone(),
                         *config,
+                        stacks.as_deref_mut(),
                     )
                     .into()
             }

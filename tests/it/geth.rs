@@ -1,4 +1,8 @@
 //! Geth tests
+
+mod consistency;
+mod runtime_oog;
+
 use crate::utils::deploy_contract;
 use alloy_primitives::{address, hex, map::HashMap, Address, Bytes, TxKind, B256, U256};
 use alloy_rpc_types_eth::TransactionInfo;
@@ -100,6 +104,56 @@ fn test_debug_empty_tracer() {
         options["tracer"] = serde_json::json!("");
         assert_eq!(trace(options.clone()), absent, "options: {options}");
     }
+}
+
+/// The default tracer moves the recorded stacks into the struct logs, matching the copied ones.
+#[test]
+fn test_debug_default_tracer_moves_stacks() {
+    let caller = address!("1000000000000000000000000000000000000001");
+    let callee = address!("1000000000000000000000000000000000000002");
+    // Call the callee with zero arguments, then push a value.
+    let mut caller_code = hex!("6000600060006000600073").to_vec();
+    caller_code.extend_from_slice(callee.as_slice());
+    caller_code.extend_from_slice(&hex!("5af150600700"));
+    let context =
+        Context::mainnet().with_db(CacheDB::<EmptyDB>::default()).modify_db_chained(|db| {
+            for (address, code) in [(caller, caller_code), (callee, hex!("6001600201").to_vec())] {
+                db.insert_account_info(
+                    address,
+                    AccountInfo {
+                        code: Some(Bytecode::new_raw(code.into())),
+                        ..Default::default()
+                    },
+                );
+            }
+        });
+    let mut inspector = DebugInspector::new(Default::default()).unwrap();
+    let mut evm = context.build_mainnet().with_inspector(&mut inspector);
+    let res = evm
+        .inspect_tx(TxEnv {
+            gas_limit: 100000,
+            kind: TransactTo::Call(caller),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(res.result.is_success());
+
+    let (ctx, inspector) = evm.ctx_inspector();
+    let DebugInspector::Default(tracer, config) = &*inspector else {
+        panic!("expected the default opcode logger");
+    };
+    let expected = tracer.geth_builder().geth_traces_with_result_gas(
+        *res.result.gas(),
+        res.result.output().unwrap_or_default().clone(),
+        *config,
+    );
+    assert!(expected.struct_logs.iter().any(|log| log.depth == 2));
+    assert!(expected.struct_logs.iter().all(|log| log.stack.is_some()));
+
+    let tx = ctx.tx().clone();
+    let block = ctx.block().clone();
+    let result = inspector.get_result(None, &tx, &block, &res, ctx.db_mut()).unwrap();
+    assert_eq!(result, GethTrace::Default(expected));
 }
 
 #[test]
@@ -1834,6 +1888,91 @@ fn test_debug_call_log_index_seed_and_reset() {
             assert_eq!(logs.len(), 1);
             assert_eq!(logs[0].index, Some(seed.unwrap_or_default() as u64));
             inspector.fuse().unwrap();
+        }
+    }
+}
+
+#[test]
+fn test_geth_4byte_tracer_skips_precompiles() {
+    // STATICCALL the sha256 precompile with 36 bytes, then an empty account with 4 bytes.
+    let code = hex!("600060006024600060025afa50600060006004600061dead5afa5000").into();
+    let opts = serde_json::from_value(serde_json::json!({ "tracer": "4byteTracer" })).unwrap();
+    let (trace, _) = trace_contract(SpecId::PRAGUE, opts, code);
+
+    match trace {
+        GethTrace::FourByteTracer(frame) => {
+            assert_eq!(frame.0, std::collections::BTreeMap::from([("0x00000000-0".into(), 1)]));
+        }
+        _ => panic!("Expected FourByteTracer"),
+    }
+}
+
+#[test]
+fn test_geth_failed_root_logs() {
+    let contract = address!("1000000000000000000000000000000000000001");
+    for (code, error) in [
+        ("60006000a000", None),
+        ("60006000a060006000fd", Some("execution reverted")),
+        ("60006000a0fe", Some("invalid opcode: INVALID")),
+        ("60006000a05b600556", Some("out of gas")),
+    ] {
+        let code = code.parse::<Bytes>().unwrap();
+        for create in [false, true] {
+            let context = Context::mainnet()
+                .with_db(CacheDB::<EmptyDB>::default())
+                .modify_cfg_chained(|cfg| cfg.set_spec_and_mainnet_gas_params(SpecId::LONDON))
+                .modify_db_chained(|db| {
+                    db.insert_account_info(
+                        contract,
+                        AccountInfo {
+                            code: Some(Bytecode::new_raw(code.clone())),
+                            ..Default::default()
+                        },
+                    );
+                });
+            let mut inspector = TracingInspector::new(
+                TracingInspectorConfig::from_geth_call_config(&CallConfig::default().with_log()),
+            );
+            let mut evm = context.build_mainnet().with_inspector(&mut inspector);
+            let res = evm
+                .inspect_tx(TxEnv {
+                    kind: if create { TxKind::Create } else { TxKind::Call(contract) },
+                    data: if create { code.clone() } else { Bytes::new() },
+                    gas_limit: 100_000,
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(res.result.is_success(), error.is_none());
+            assert_eq!(res.result.logs().len(), usize::from(error.is_none()));
+            // The inspector records the emitted log even when execution rolls it back.
+            assert_eq!(inspector.traces().nodes()[0].logs.len(), 1);
+            let builder = inspector.geth_builder();
+
+            for with_log in [false, true] {
+                let expected_logs = usize::from(with_log && error.is_none());
+                for only_top_call in [false, true] {
+                    let frame = builder.geth_call_traces(
+                        CallConfig { with_log: Some(with_log), only_top_call: Some(only_top_call) },
+                        res.result.tx_gas_used(),
+                    );
+                    assert_eq!(frame.error.as_deref(), error);
+                    assert_eq!(frame.logs.len(), expected_logs);
+                    if expected_logs == 0 {
+                        assert_eq!(serde_json::to_value(frame).unwrap().get("logs"), None);
+                    }
+                }
+
+                let frame = builder.geth_erc7562_traces(
+                    Erc7562Config { with_log: Some(with_log), ..Default::default() },
+                    res.result.tx_gas_used(),
+                    EmptyDB::default(),
+                );
+                assert_eq!(frame.error.as_deref(), error);
+                assert_eq!(frame.logs.len(), expected_logs);
+                if expected_logs == 0 {
+                    assert_eq!(serde_json::to_value(frame).unwrap().get("logs"), None);
+                }
+            }
         }
     }
 }

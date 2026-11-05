@@ -9,8 +9,8 @@ use alloy_rpc_types_trace::geth::{
 };
 use revm::{
     context_interface::{
-        result::{HaltReasonTr, ResultAndState},
-        ContextTr,
+        result::{ExecutionResult, HaltReasonTr, ResultAndState},
+        ContextTr, Transaction,
     },
     handler::FrameResult,
     inspector::JournalExt,
@@ -56,44 +56,32 @@ impl MuxInspector {
             #[allow(unreachable_patterns)]
             match builtin {
                 GethDebugBuiltInTracerType::FourByteTracer => {
-                    if tracer_config.is_some() {
-                        return Err(Error::UnexpectedConfig(builtin));
-                    }
                     four_byte = Some(FourByteInspector::default());
                 }
                 GethDebugBuiltInTracerType::CallTracer => {
-                    let call_config =
-                        tracer_config.ok_or(Error::MissingConfig(builtin))?.into_call_config()?;
+                    let call_config = tracer_config.unwrap_or_default().into_call_config()?;
 
                     inspector_config
                         .merge(TracingInspectorConfig::from_geth_call_config(&call_config));
                     configs.push((builtin, TraceConfig::Call(call_config)));
                 }
                 GethDebugBuiltInTracerType::PreStateTracer => {
-                    let prestate_config = tracer_config
-                        .ok_or(Error::MissingConfig(builtin))?
-                        .into_pre_state_config()?;
+                    let prestate_config =
+                        tracer_config.unwrap_or_default().into_pre_state_config()?;
 
                     inspector_config
                         .merge(TracingInspectorConfig::from_geth_prestate_config(&prestate_config));
                     configs.push((builtin, TraceConfig::PreState(prestate_config)));
                 }
                 GethDebugBuiltInTracerType::NoopTracer => {
-                    if tracer_config.is_some() {
-                        return Err(Error::UnexpectedConfig(builtin));
-                    }
                     configs.push((builtin, TraceConfig::Noop));
                 }
                 GethDebugBuiltInTracerType::StateGasTracer => {
-                    if tracer_config.is_some() {
-                        return Err(Error::UnexpectedConfig(builtin));
-                    }
                     configs.push((builtin, TraceConfig::StateGas));
                 }
                 GethDebugBuiltInTracerType::FlatCallTracer => {
-                    let flatcall_config = tracer_config
-                        .ok_or(Error::MissingConfig(builtin))?
-                        .into_flat_call_config()?;
+                    let flatcall_config =
+                        tracer_config.unwrap_or_default().into_flat_call_config()?;
 
                     inspector_config
                         .merge(TracingInspectorConfig::from_flat_call_config(&flatcall_config));
@@ -158,6 +146,7 @@ impl MuxInspector {
                         inspector
                             .clone()
                             .into_parity_builder()
+                            .with_transaction_gas_used(result.result.tx_gas_used())
                             .into_localized_transaction_traces(tx_info)
                             .into()
                     } else {
@@ -188,10 +177,16 @@ impl MuxInspector {
         Ok(MuxFrame(frame))
     }
 
-    /// Sets the root gas limit for tracers sharing the tracing inspector.
-    pub(crate) fn set_transaction_gas_limit(&mut self, gas_limit: u64) {
+    /// Finalizes the transaction root for tracers sharing the tracing inspector.
+    pub(crate) fn finalize_transaction(
+        &mut self,
+        tx: &impl Transaction,
+        result: &ExecutionResult<impl HaltReasonTr>,
+    ) {
         if let Some(inspector) = &mut self.tracing {
-            inspector.set_transaction_gas_limit(gas_limit);
+            inspector.recover_runtime_oog_root(tx, result);
+            inspector.set_transaction_gas_limit(tx.gas_limit());
+            inspector.set_transaction_caller(tx.caller());
         }
     }
 }
