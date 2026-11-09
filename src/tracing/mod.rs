@@ -508,13 +508,13 @@ impl TracingInspector {
         let stack = if self.config.record_stack_snapshots.is_all()
             || self.config.record_stack_snapshots.is_full()
         {
-            Some(interp.stack.data().as_slice().into())
+            Some(interp.stack.data().as_slice())
         } else if self.config.record_stack_snapshots.is_top() {
-            let top = interp.stack.data().last().map(core::slice::from_ref).unwrap_or_default();
-            Some(top.into())
+            Some(interp.stack.data().last().map(core::slice::from_ref).unwrap_or_default())
         } else {
             None
-        };
+        }
+        .and_then(|stack| self.budget.reserve(size_of_val(stack)).then(|| stack.into()));
         let returndata = if self.config.record_returndata_snapshots {
             interp.return_data.buffer().clone()
         } else {
@@ -652,14 +652,12 @@ impl TracingInspector {
             || self.config.record_stack_snapshots.is_pushes()
         {
             let outputs = if step.op.is_valid() { step.op.outputs() as usize } else { 0 };
-            step.push_stack = Some(
-                interp
-                    .stack
-                    .data()
-                    .get(interp.stack.len().saturating_sub(outputs)..)
-                    .unwrap_or_default()
-                    .into(),
-            );
+            let pushed = interp
+                .stack
+                .data()
+                .get(interp.stack.len().saturating_sub(outputs)..)
+                .unwrap_or_default();
+            step.push_stack = self.budget.reserve(size_of_val(pushed)).then(|| pushed.into());
         }
 
         let journal = context.journal_ref().journal();

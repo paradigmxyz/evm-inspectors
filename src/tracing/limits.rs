@@ -25,8 +25,8 @@ pub enum TraceLimitBehavior {
 pub struct TraceLimits {
     /// Maximum cumulative byte-buffer allocation lengths between resets. `None` means unlimited.
     ///
-    /// Counts copied call inputs, memory snapshots, immediate bytes and memory deltas.
-    /// Shared buffer clones, stack/trace vector elements and allocator overhead are not counted.
+    /// Counts copied call inputs, memory snapshots, stack snapshots, immediate bytes and memory
+    /// deltas. Shared buffer clones, trace vector elements and allocator overhead are not counted.
     /// Checked before each byte-buffer allocation. Recording stops at this limit.
     pub max_recorded_bytes: Option<usize>,
     /// What to do when a recording would exceed `max_recorded_bytes`.
@@ -64,7 +64,7 @@ impl TraceBudget {
             self.exceeded = true;
             return false;
         }
-        self.recorded += bytes;
+        self.recorded = self.recorded.saturating_add(bytes);
         true
     }
 
@@ -90,5 +90,19 @@ impl TraceBudget {
             interp.bytecode.reset_action();
             interp.halt_fatal();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unlimited_budget_saturates() {
+        let mut budget = TraceBudget::default();
+        assert!(budget.reserve(usize::MAX));
+        assert!(budget.reserve(1));
+        assert_eq!(budget.recorded, usize::MAX);
+        assert!(!budget.exceeded());
     }
 }
