@@ -1,6 +1,7 @@
 //! Recording limits use revm's existing execution error channel.
 
-use alloy_primitives::{hex, Address, Bytes};
+use alloy_primitives::{hex, Address, Bytes, U256};
+use alloy_rpc_types_trace::geth::GethDefaultTracingOptions;
 use core::convert::Infallible;
 use revm::{
     bytecode::Bytecode,
@@ -15,7 +16,7 @@ use revm::{
     Context, InspectEvm, MainBuilder, MainContext,
 };
 use revm_inspectors::tracing::{
-    TraceLimitBehavior, TraceLimits, TracingInspector, TracingInspectorConfig,
+    StackSnapshotType, TraceLimitBehavior, TraceLimits, TracingInspector, TracingInspectorConfig,
 };
 
 fn run(
@@ -118,18 +119,60 @@ fn only_new_byte_buffers_are_charged() {
     assert_eq!(inspector.recorded_bytes(), 0);
 
     // One memory snapshot allocation, reused across subsequent steps.
+    // Stack depth at each step is 0, 1, 2, 0, 1, 0, 1, 0, and four steps push one item.
     let code = hex!("60015f5260025060035000");
     let config = config.steps();
     for (config, bytes) in [
         (config.memory_snapshots(), 32),
         (config.set_step_deltas(true), 32),
         (config.record_immediate_bytes(), 3),
-        (config.stack_snapshots(), 0),
+        (config.set_stack_snapshots(StackSnapshotType::Full), 5 * 32),
+        (config.set_stack_snapshots(StackSnapshotType::Top), 4 * 32),
+        (config.set_stack_snapshots(StackSnapshotType::Pushes), 4 * 32),
+        (config.set_stack_snapshots(StackSnapshotType::All), 9 * 32),
+        (config.set_stack_snapshots(StackSnapshotType::None), 0),
     ] {
         let (inspector, result) = run(&code, limited(config, bytes));
         assert!(result.unwrap().is_success());
         assert_eq!(inspector.recorded_bytes(), bytes);
     }
+}
+
+#[test]
+fn default_struct_logger_stack_snapshots_are_charged() {
+    // 1024 PUSH0s, so each step snapshots a stack one item deeper than the last.
+    let code = [[0x5f; 1024].as_slice(), &[0x00]].concat();
+    let config = TracingInspectorConfig::from_geth_config(&GethDefaultTracingOptions::default());
+    let (baseline, result) = run(&code, TracingInspector::new(config));
+    assert!(result.unwrap().is_success());
+    assert_eq!(baseline.recorded_bytes(), 1024 * 1025 / 2 * size_of::<U256>());
+
+    let limit = 1 << 20;
+    let (inspector, result) = run(&code, limited(config, limit));
+    assert!(
+        matches!(result, Err(EVMError::Custom(ref message)) if message == "trace recorded byte limit exceeded")
+    );
+    assert!(inspector.limit_exceeded());
+    assert!(inspector.recorded_bytes() <= limit);
+
+    let (inspector, result) = run(
+        &code,
+        TracingInspector::new(config)
+            .with_limits(TraceLimits::default().set_max_recorded_bytes(Some(limit))),
+    );
+    assert!(result.unwrap().is_success());
+    assert!(inspector.limit_exceeded());
+    assert!(inspector.recorded_bytes() <= limit);
+    let steps = &inspector.traces().nodes()[0].trace.steps;
+    assert!(steps.len() < 1025);
+    assert!(steps.last().is_some_and(|step| step.stack.is_none()));
+
+    let config = TracingInspectorConfig::from_geth_config(
+        &GethDefaultTracingOptions::default().disable_stack(),
+    );
+    let (inspector, result) = run(&code, limited(config, 0));
+    assert!(result.unwrap().is_success());
+    assert_eq!(inspector.recorded_bytes(), 0);
 }
 
 #[test]
