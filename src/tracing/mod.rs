@@ -92,6 +92,9 @@ pub struct TracingInspector {
     record_step_end: bool,
     /// Number of logs recorded so far, used as the index of the next log.
     log_count: usize,
+    /// The value of `log_count` when each active call started, used to roll back the log index
+    /// when a call fails and its logs are discarded.
+    log_count_checkpoints: Vec<usize>,
     /// Number of opcode steps captured across all calls since the last reset.
     recorded_steps: u64,
     /// Tracks the journal len in the step, used in step_end to check if the journal has changed
@@ -138,6 +141,7 @@ impl TracingInspector {
             traces,
             trace_stack,
             log_count,
+            log_count_checkpoints,
             last_journal_len,
             spec_id,
             record_step_end,
@@ -163,6 +167,7 @@ impl TracingInspector {
         trace_stack.clear();
         spec_id.take();
         *log_count = 0;
+        log_count_checkpoints.clear();
         *last_journal_len = 0;
         *record_step_end = false;
         *recorded_steps = 0;
@@ -397,6 +402,9 @@ impl TracingInspector {
         // the currently active call is the parent of the new call
         let parent = self.trace_stack.last().copied().unwrap_or_default();
 
+        // remember where the log index was, so it can be rolled back if this call fails
+        self.log_count_checkpoints.push(self.log_count);
+
         self.trace_stack.push(self.traces.push_trace(
             parent,
             push_kind,
@@ -439,6 +447,15 @@ impl TracingInspector {
         trace.status = Some(result);
         trace.success = trace.status.is_some_and(|status| status.is_ok());
         trace.output = output.clone();
+
+        // Logs of a failed call (and of its subcalls) are discarded, so their indices are freed
+        // up for the logs that follow, like geth and the transaction receipt do.
+        let log_count_checkpoint = self.log_count_checkpoints.pop();
+        if !trace.success {
+            if let Some(checkpoint) = log_count_checkpoint {
+                self.log_count = checkpoint;
+            }
+        }
 
         if let Some(address) = created_address {
             // A new contract was created via CREATE

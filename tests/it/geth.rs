@@ -266,6 +266,11 @@ fn test_geth_calltracer_logs() {
     // third subcall succeeded, one log
     assert_eq!(call_frame.calls[2].logs.len(), 1);
     assert!(call_frame.calls[2].error.is_none());
+
+    // log indices match the receipt: the logs of the failed subcalls are discarded, so the
+    // surviving log of the third subcall is the second log of the transaction
+    assert_eq!(call_frame.logs[0].index, Some(0));
+    assert_eq!(call_frame.calls[2].logs[0].index, Some(1));
 }
 
 #[test]
